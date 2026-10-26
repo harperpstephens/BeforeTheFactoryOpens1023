@@ -1,0 +1,10 @@
+{
+  "opening_time": 4.0,
+  "projected_band_gap_pp": 0.20463782644544737,
+  "opening_tv": 0.009080098858010033,
+  "long_run_band_gap_pp": 0.4458997726636382,
+  "band_anticipation_ratio": 0.45893234083304785,
+  "long_run_tv_from_surprise_state": 0.01943751789937434,
+  "tv_anticipation_ratio": 0.467142919431205,
+  "ratio_warning": "Ratios are normalizations, not guaranteed fractions in [0,1]."
+}
