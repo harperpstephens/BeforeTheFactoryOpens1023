@@ -6,6 +6,7 @@ authors:
     given-names: Harper
     affiliation: University of Louisville
     email: hpstep01@louisville.edu
+    orcid: "https://orcid.org/0009-0000-0286-2139"
 type: software
 date-released: 2026-10-26
 license: MIT
@@ -23,8 +24,9 @@ preferred-citation:
   authors:
     - family-names: Stephens
       given-names: Harper
+      orcid: "https://orcid.org/0009-0000-0286-2139"
   institution:
     name: University of Louisville
   year: 2026
   month: 10
-  url: "https://harperpstephens.site/research/"
+  url: "https://ssrn.com/abstract=7500178"
