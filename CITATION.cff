@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper."
+title: "Before the Factory Opens: Anticipation and Spatial Adjustment to Announced and Delayed Local Shocks"
+authors:
+  - family-names: Stephens
+    given-names: Harper
+    affiliation: University of Louisville
+    email: hpstep01@louisville.edu
+type: software
+date-released: 2026-10-26
+license: MIT
+repository-code: "https://github.com/harperpstephens/BeforeTheFactoryOpens1023"
+url: "https://harperpstephens.site/research/"
+keywords:
+  - mean field games
+  - spatial equilibrium
+  - anticipation
+  - place-based policy
+  - LODES
+preferred-citation:
+  type: report
+  title: "Before the Factory Opens: Anticipation and Spatial Adjustment to Announced and Delayed Local Shocks"
+  authors:
+    - family-names: Stephens
+      given-names: Harper
+  institution:
+    name: University of Louisville
+  year: 2026
+  month: 10
+  url: "https://harperpstephens.site/research/"
