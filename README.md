@@ -1,6 +1,6 @@
 # Before the Factory Opens
 
-Replication code for "[Before the Factory Opens: Anticipation and Spatial Adjustment to Announced and Delayed Local Shocks](https://ssrn.com/abstract=7500178)" by Harper Stephens (working paper, 2026).
+Replication code for "[Before the Factory Opens: Anticipation and Spatial Adjustment to Announced and Delayed Local Shocks](https://dx.doi.org/10.2139/ssrn.7500178)" by Harper Stephens (working paper, 2026).
 
 The paper uses a spatial mean field game, calibrated to 2021 Census LODES residences, to measure how much workers relocate in anticipation of Intel's Ohio semiconductor plant before it opens.
 
@@ -50,8 +50,9 @@ All inputs are public.
   institution = {University of Louisville},
   type        = {Working Paper},
   year        = {2026},
-  note        = {Available at SSRN: https://ssrn.com/abstract=7500178},
-  url         = {https://ssrn.com/abstract=7500178}
+  note        = {Available at SSRN},
+  doi         = {10.2139/ssrn.7500178},
+  url         = {https://dx.doi.org/10.2139/ssrn.7500178}
 }
 ```
 
