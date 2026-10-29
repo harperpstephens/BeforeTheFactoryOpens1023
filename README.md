@@ -20,9 +20,9 @@ Every script has `--help`.
 ## Usage
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
-python scripts/before_factory_opens_replay_1d_outputs.py \
+python3 scripts/before_factory_opens_replay_1d_outputs.py \
   --preserved-output outputs/benchmark_1d \
   --output-dir outputs/replayed_1d_results
 ```
