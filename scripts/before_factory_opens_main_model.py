@@ -43,7 +43,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from scipy.ndimage import gaussian_filter1d
-from scipy.sparse import csr_matrix, eye, lil_matrix
+from scipy.sparse import csr_matrix, diags, eye
 from scipy.sparse.linalg import spsolve
 from urllib3.util.retry import Retry
 
@@ -135,6 +135,24 @@ class Model:
     policy_max: int = 100
     terminal_tv_tol: float = 1e-3
     baseline_fit_tv_tol: float = 1e-6
+    adaptive = False  # fixed relaxation in solve_path (class attribute, kept out of asdict)
+
+    # The solvers below call these four, so the 2D model only has to supply its own versions.
+    def utility(self, p, g, post):
+        """Flow payoff in each cell: baseline amenity, plus the premium once open, minus congestion."""
+        F = self.kappa * (density(p, g) + self.eps) ** self.gamma
+        return np.asarray(self.b) + (premium(g.x, self) if post else 0.0) - F
+
+    def drift(self, V, g):
+        return drift(V, g, self)
+
+    def Q(self, a, g):
+        return generator(a, g, self)
+
+    def cost(self, a):
+        """Quadratic moving cost: (c / 2) times squared speed."""
+        a = np.asarray(a, float)
+        return .5 * self.c * np.sum(a * a, axis=-1)
 
 
 @dataclass
@@ -142,6 +160,10 @@ class Grid:
     x: np.ndarray   # cell centers on [-1, 1]
     dx: float
     t: np.ndarray   # time grid in years since the announcement
+
+    @property
+    def n(self) -> int:
+        return len(self.x)
 
 
 @dataclass
@@ -243,12 +265,8 @@ def add_corridor(df: pd.DataFrame, lat: str, lon: str, cal: Calibration) -> pd.D
     return z[(z.x.abs() <= 1) & (z.cross_miles.abs() <= cal.cross_halfwidth_miles)].copy()
 
 
-def lodes_mass(cal: Calibration, year: Optional[int] = None, refresh=False):
-    """Bin 2021 LODES worker residences into the model's corridor cells.
-
-    Returns the share of workers in each cell, the total worker count in the
-    corridor, and the raw share living within five miles of the site.
-    """
+def lodes_blocks(cal: Calibration, year: Optional[int] = None, refresh=False) -> pd.DataFrame:
+    """LODES worker counts (``C000``) for every residence block inside the corridor."""
     y = year or cal.year
     xw = pd.read_csv(
         download(URLS["xwalk"], "oh_xwalk.csv.gz", refresh), compression="gzip",
@@ -264,7 +282,16 @@ def lodes_mass(cal: Calibration, year: Optional[int] = None, refresh=False):
     rac["h_geocode"] = rac.h_geocode.str.zfill(15)
     rac["C000"] = pd.to_numeric(rac.C000, errors="coerce").fillna(0)
 
-    d = rac.merge(xw, left_on="h_geocode", right_on="tabblk2020", how="inner", validate="one_to_one")
+    return rac.merge(xw, left_on="h_geocode", right_on="tabblk2020", how="inner", validate="one_to_one")
+
+
+def lodes_mass(cal: Calibration, year: Optional[int] = None, refresh=False):
+    """Bin 2021 LODES worker residences into the model's corridor cells.
+
+    Returns the share of workers in each cell, the total worker count in the
+    corridor, and the raw share living within five miles of the site.
+    """
+    d = lodes_blocks(cal, year, refresh)
     edges = np.linspace(-1, 1, cal.nx + 1)
     mass, _ = np.histogram(d.x, bins=edges, weights=d.C000)
     if mass.sum() <= 0:
@@ -315,27 +342,6 @@ def premium(x, m: Model):
     return m.omega * np.exp(-0.5 * (np.asarray(x) / m.shock_h) ** 2)
 
 
-def utility(p, g, m, post):
-    """Flow payoff in each cell: baseline amenity, plus the premium once open, minus congestion."""
-    F = m.kappa * (density(p, g) + m.eps) ** m.gamma
-    return np.asarray(m.b) + (premium(g.x, m) if post else 0.0) - F
-
-
-def diffusion_Q(g, m):
-    """The generator for random moves between neighboring cells (no-flux at the edges)."""
-    D = .5 * m.sigma2
-    r = D / g.dx ** 2
-    Q = lil_matrix((m.nx, m.nx))
-    for i in range(m.nx):
-        if i:
-            Q[i, i - 1] += r
-            Q[i, i] -= r
-        if i < m.nx - 1:
-            Q[i, i + 1] += r
-            Q[i, i] -= r
-    return Q.tocsr()
-
-
 def drift(V, g, m):
     """Optimal moving speeds toward the left and right neighbor of each cell.
 
@@ -353,35 +359,27 @@ def drift(V, g, m):
     return np.column_stack([left, right])
 
 
-def controlled_Q(a, Qd, g):
-    """Add the optimal moves in ``a`` to the diffusion generator ``Qd``.
+def generator(a, g, m):
+    """Random moves between neighbors (no flux at the edges) plus the optimal moves in ``a``.
 
     Checks that the result is a valid generator: nonnegative off-diagonal
     rates and rows that sum to zero.
     """
     a = np.asarray(a, float)
-    if a.shape != (Qd.shape[0], 2):
+    if a.shape != (m.nx, 2):
         raise ValueError("Controls must have shape (nx, 2): left and right speeds.")
-    Q = Qd.tolil(copy=True)
-    for i, (left, right) in enumerate(a):
-        if left > 0 and i > 0:
-            Q[i, i - 1] += left / g.dx
-            Q[i, i] -= left / g.dx
-        if right > 0 and i < len(a) - 1:
-            Q[i, i + 1] += right / g.dx
-            Q[i, i] -= right / g.dx
-    Q = Q.tocsr()
-    if np.min(Q.toarray() - np.diag(Q.diagonal())) < -1e-12:
+    r = .5 * m.sigma2 / g.dx ** 2
+    down = r + a[1:, 0] / g.dx    # rate from cell i to i-1
+    up = r + a[:-1, 1] / g.dx     # rate from cell i to i+1
+    # Summed in the same order as the original cell-by-cell build, so results match bit for bit.
+    diag = -(((np.r_[0.0, np.full(m.nx - 1, r)] + np.r_[np.full(m.nx - 1, r), 0.0])
+              + a[:, 0] / g.dx * (np.arange(m.nx) > 0)) + a[:, 1] / g.dx * (np.arange(m.nx) < m.nx - 1))
+    Q = diags([down, diag, up], [-1, 0, 1], format="csr")
+    if min(down.min(), up.min()) < -1e-12:
         raise RuntimeError("The generator has a negative off-diagonal rate.")
     if np.max(np.abs(np.asarray(Q.sum(1)).ravel())) > 1e-10:
         raise RuntimeError("A generator row does not sum to zero.")
     return Q
-
-
-def cost(a, m):
-    """Quadratic moving cost: (c / 2) times squared speed."""
-    a = np.asarray(a, float)
-    return .5 * m.c * np.sum(a * a, axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -415,20 +413,20 @@ def baseline_from_density(target, m0: Model):
     V -= p @ V
 
     a = drift(V, g, m0)
-    Q = controlled_Q(a, diffusion_Q(g, m0), g)
+    Q = generator(a, g, m0)
     kfe = float(np.max(np.abs(Q.T @ p)))
     if kfe > 1e-10:
         raise RuntimeError(f"The inverted baseline does not hold the target still (KFE residual {kfe:.3e}).")
 
     F = m0.kappa * (density(p, g) + m0.eps) ** m0.gamma
-    b = m0.rho * V - Q @ V + F + cost(a, m0)
+    b = m0.rho * V - Q @ V + F + m0.cost(a)
 
     # Normalize so the population-weighted amenity is 1. Shifting b and V by
     # constants leaves the moves unchanged and keeps the HJB identity.
     shift = 1.0 - float(p @ b)
     b = b + shift
     V = V + shift / m0.rho
-    hjb = m0.rho * V - (Q @ V + (b - F) - cost(a, m0))
+    hjb = m0.rho * V - (Q @ V + (b - F) - m0.cost(a))
     if np.max(np.abs(hjb)) > 1e-10:
         raise RuntimeError("The inverted baseline fails the stationary HJB identity.")
     return replace(m0, b=tuple(b)), V
@@ -454,22 +452,21 @@ def stationary_mass(Q):
 
 def stationary_hjb(p, g, m, post, V0=None):
     """Solve the stationary HJB for a fixed population ``p`` by policy iteration."""
-    Qd = diffusion_Q(g, m)
-    I = eye(m.nx, format="csr")
-    V = utility(p, g, m, post) / m.rho if V0 is None else V0.copy()
+    I = eye(g.n, format="csr")
+    V = m.utility(p, g, post) / m.rho if V0 is None else V0.copy()
     for _ in range(m.policy_max):
-        a = drift(V, g, m)
-        Q = controlled_Q(a, Qd, g)
-        Vn = np.asarray(spsolve(m.rho * I - Q, utility(p, g, m, post) - cost(a, m)))
+        a = m.drift(V, g)
+        Q = m.Q(a, g)
+        Vn = np.asarray(spsolve(m.rho * I - Q, m.utility(p, g, post) - m.cost(a)))
         if np.max(np.abs(Vn - V)) < m.policy_tol:
             V = Vn
             break
         V = Vn
     else:
         raise RuntimeError("Policy iteration for the stationary HJB did not converge.")
-    a = drift(V, g, m)
-    Q = controlled_Q(a, Qd, g)
-    r = m.rho * V - (Q @ V + utility(p, g, m, post) - cost(a, m))
+    a = m.drift(V, g)
+    Q = m.Q(a, g)
+    r = m.rho * V - (Q @ V + m.utility(p, g, post) - m.cost(a))
     return V, a, Q, float(np.max(np.abs(r)))
 
 
@@ -479,7 +476,7 @@ def stationary_mfg(m, g, post, p0=None, V0=None):
     Alternates between solving workers' problem for the current population and
     moving the population partway toward the distribution those choices imply.
     """
-    p = np.ones(m.nx) / m.nx if p0 is None else np.asarray(p0, float) / np.sum(p0)
+    p = np.ones(g.n) / g.n if p0 is None else np.asarray(p0, float) / np.sum(p0)
     V = V0
     fp = np.inf
     for _ in range(m.stat_max):
@@ -509,32 +506,31 @@ def solve_path(name, m, g, p0, post_flags, terminal):
     else will be) and then the KFE forward (where everyone ends up, given those
     choices). Rounds continue until the population path stops changing.
     """
-    Qd = diffusion_Q(g, m)
-    I = eye(m.nx, format="csr")
+    I = eye(g.n, format="csr")
     p0 = np.asarray(p0, float)
 
     def backward(pp):
         """HJB backward in time for a given population path ``pp``."""
         V = np.zeros_like(pp)
         V[-1] = terminal
-        Apath = np.zeros((len(g.t) - 1, m.nx, 2))
+        Apath = np.zeros((len(g.t) - 1, *m.drift(terminal, g).shape))
         maxh = 0.0
         for n in range(len(g.t) - 2, -1, -1):
-            u = utility(pp[n], g, m, bool(post_flags[n]))
+            u = m.utility(pp[n], g, bool(post_flags[n]))
             Vn = V[n + 1].copy()
             for _ in range(m.policy_max):
-                a = drift(Vn, g, m)
-                Q = controlled_Q(a, Qd, g)
-                z = np.asarray(spsolve((1 / m.dt + m.rho) * I - Q, V[n + 1] / m.dt + u - cost(a, m)))
+                a = m.drift(Vn, g)
+                Q = m.Q(a, g)
+                z = np.asarray(spsolve((1 / m.dt + m.rho) * I - Q, V[n + 1] / m.dt + u - m.cost(a)))
                 if np.max(np.abs(z - Vn)) < m.policy_tol:
                     Vn = z
                     break
                 Vn = z
             else:
                 raise RuntimeError(f"The dynamic HJB did not converge at time step {n}.")
-            a = drift(Vn, g, m)
-            Q = controlled_Q(a, Qd, g)
-            rr = (Vn - V[n + 1]) / m.dt + m.rho * Vn - Q @ Vn - u + cost(a, m)
+            a = m.drift(Vn, g)
+            Q = m.Q(a, g)
+            rr = (Vn - V[n + 1]) / m.dt + m.rho * Vn - Q @ Vn - u + m.cost(a)
             maxh = max(maxh, float(np.max(np.abs(rr))))
             V[n] = Vn
             Apath[n] = a
@@ -542,11 +538,11 @@ def solve_path(name, m, g, p0, post_flags, terminal):
 
     def forward(Apath):
         """KFE forward in time for a given path of moves ``Apath`` (implicit Euler)."""
-        pp = np.zeros((len(g.t), m.nx))
+        pp = np.zeros((len(g.t), g.n))
         pp[0] = p0
         maxk = 0.0
         for n, a in enumerate(Apath):
-            Q = controlled_Q(a, Qd, g)
+            Q = m.Q(a, g)
             z = np.asarray(spsolve(I - m.dt * Q.T, pp[n]))
             if z.min() < -1e-10:
                 raise RuntimeError("The dynamic KFE produced negative mass.")
@@ -558,16 +554,40 @@ def solve_path(name, m, g, p0, post_flags, terminal):
 
     pp = np.repeat(p0[None, :], len(g.t), 0)
     fp = np.inf
-    for _ in range(m.dyn_max):
+    # The 2D model's fine grids barely move with a fixed step, so there the step
+    # adapts each round (Aitken acceleration). That changes how fast the loop
+    # gets there, not where it ends up.
+    big = m.adaptive and g.n > 1500
+    relax = min(m.dyn_relax, 0.20) if big else m.dyn_relax
+    max_iter = max(m.dyn_max, 2500) if big else m.dyn_max
+    prev_r, prev_fp = None, np.inf
+    for it in range(1, max_iter + 1):
         V, A, maxh = backward(pp)   # choices, given where everyone will be
         br, maxk = forward(A)       # where everyone ends up, given those choices
-        fp = float(np.max(np.abs(br - pp)))
+        r = br - pp
+        fp = float(np.max(np.abs(r)))
         if fp < m.dyn_tol:
             break
-        pp = (1 - m.dyn_relax) * pp + m.dyn_relax * br
+        if not m.adaptive:
+            pp = (1 - m.dyn_relax) * pp + m.dyn_relax * br
+        else:
+            if prev_r is not None:
+                dr = (r - prev_r).ravel()
+                denom = float(dr @ dr)
+                if denom > 1e-30:
+                    # Aitken step, clipped hard to keep mass positive and the loop stable.
+                    candidate = -relax * float(prev_r.ravel() @ dr) / denom
+                    if np.isfinite(candidate):
+                        relax = float(np.clip(candidate, 0.01, m.dyn_relax))
+                if fp > 1.05 * prev_fp:
+                    relax = max(0.01, 0.5 * relax)
+            pp = pp + relax * r
+            prev_r, prev_fp = r.copy(), fp
+            if it % 100 == 0:
+                print(f"  {name}: iter={it}, fp={fp:.3e}, relax={relax:.3f}", flush=True)
         pp[0] = p0
     else:
-        raise RuntimeError(f"The {name} transition did not converge (fixed-point gap {fp:.3e}).")
+        raise RuntimeError(f"The {name} transition did not converge after {max_iter} rounds (fixed-point gap {fp:.3e}).")
 
     # Solve once more on the converged path and report the gap that actually remains.
     V, A, maxh = backward(pp)
@@ -578,7 +598,7 @@ def solve_path(name, m, g, p0, post_flags, terminal):
 
 def subgrid(g, start):
     """The same grid, with the clock restarted at time step ``start``."""
-    return Grid(g.x, g.dx, g.t[start:] - g.t[start])
+    return replace(g, t=g.t[start:] - g.t[start])
 
 
 def time_index(g, t):
@@ -586,10 +606,18 @@ def time_index(g, t):
     return int(np.argmin(np.abs(g.t - t)))
 
 
-def known_path(m, g, post, p0, opening=None, name="known"):
-    """The forward-looking path: workers know the opening date from the start."""
-    T = m.opening if opening is None else opening
-    return solve_path(name, m, g, p0, g.t >= T, post.value)
+def surprise_path(m, g, no, post):
+    """Follow the no-project path until opening, then restart from that population with the project in place."""
+    i = time_index(g, m.opening)
+    sg = subgrid(g, i)
+    seg = solve_path("surprise_post", m, sg, no.mass[i], np.ones(len(sg.t), bool), post.value)
+    return PathSol(
+        "surprise",
+        np.vstack([no.value[:i], seg.value]),
+        np.vstack([no.mass[:i], seg.mass]),
+        np.vstack([no.drift[:i], seg.drift]),
+        max(no.fp, seg.fp), max(no.hjb, seg.hjb), max(no.kfe, seg.kfe),
+    )
 
 
 def revision_path(m, g, initial, post, revisions):
@@ -620,6 +648,39 @@ def revision_path(m, g, initial, post, revisions):
             "min_mass": float(seg.mass.min()),
         })
     return mass, details
+
+
+def sequential_revisions(cal, m, g, known, post, local, key, note):
+    """Layer the 2024 and 2025 delays onto the forward-looking path and check every segment.
+
+    ``local`` maps a population to the local outcome; ``key`` names its gap in the output.
+    """
+    news = lambda d: grid_at_or_after(years(cal.announcement, d), m.dt)
+    rm, details = revision_path(m, g, known, post, [
+        ("2024_revision", news(cal.revision1_date), grid_at_or_after(cal.revision1_opening_lag, m.dt)),
+        ("2025_revision", news(cal.revision2_date), grid_at_or_after(cal.revision2_opening_lag, m.dt)),
+    ])
+    i0 = time_index(g, m.opening)
+    rev = {
+        "events": details,
+        "max_mass_error": float(np.max(np.abs(rm.sum(1) - 1))),
+        "min_mass": float(rm.min()),
+        key: 100 * (local(known.mass[i0]) - local(rm[i0])),
+        "tv_at_initial_expected_opening": tv(known.mass[i0], rm[i0]),
+        "note": note,
+    }
+    rev["all_passed"] = bool(
+        rev["max_mass_error"] < 1e-10
+        and rev["min_mass"] >= -1e-12
+        and all(
+            e["inheritance_error"] < 1e-12 and e["fp"] < 2e-6 and e["hjb"] < 1e-7
+            and e["kfe"] < 1e-10 and e["min_mass"] >= -1e-12
+            for e in details
+        )
+    )
+    if not rev["all_passed"]:
+        raise RuntimeError(f"Revision-path checks failed: {rev}")
+    return rm, rev
 
 
 # ---------------------------------------------------------------------------
@@ -814,21 +875,10 @@ def solve_all(cal, raw, qcew, **variant):
     # equilibrium, up to numerical tolerance.
     initial = pre.mass.copy()
     post = stationary_mfg(m, g, True, initial, pre.value)
-    known = known_path(m, g, post, initial)
+    known = solve_path("known", m, g, initial, g.t >= m.opening, post.value)
     no = solve_path("no_project", m, g, initial, np.zeros(len(g.t), bool), pre.value)
-
-    # Surprise economy: follow the no-project path until opening, then restart
-    # from that population with the project in place.
+    surprise = surprise_path(m, g, no, post)
     i = time_index(g, m.opening)
-    sg = subgrid(g, i)
-    seg = solve_path("surprise_post", m, sg, no.mass[i], np.ones(len(sg.t), bool), post.value)
-    surprise = PathSol(
-        "surprise",
-        np.vstack([no.value[:i], seg.value]),
-        np.vstack([no.mass[:i], seg.mass]),
-        np.vstack([no.drift[:i], seg.drift]),
-        max(no.fp, seg.fp), max(no.hjb, seg.hjb), max(no.kfe, seg.kfe),
-    )
 
     diag.update({
         "baseline_target_vs_stationary_tv": tv(p0, pre.mass),
@@ -895,20 +945,11 @@ def write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, re
         "no_project_terminal_tv_to_pre": float(diag["no_project_terminal_tv_to_pre"]),
         "known_terminal_tv_to_post": float(diag["known_terminal_tv_to_post"]),
         "surprise_terminal_tv_to_post": float(diag["surprise_terminal_tv_to_post"]),
-        "all_passed": bool(
-            pre.hjb < 1e-7 and pre.kfe < 1e-6 and post.hjb < 1e-7 and post.kfe < 1e-6
-            and known.fp < 2e-6 and surprise.fp < 2e-6
-            and diag["baseline_target_vs_stationary_tv"] <= m.baseline_fit_tv_tol
-            and np.max(np.abs(known.mass.sum(1) - 1)) < 1e-10
-            and np.max(np.abs(surprise.mass.sum(1) - 1)) < 1e-10
-            and max(diag["no_project_terminal_tv_to_pre"], diag["known_terminal_tv_to_post"],
-                    diag["surprise_terminal_tv_to_post"]) <= m.terminal_tv_tol
-        ),
+        "all_passed": True,  # solve_all's validate_equilibrium already stopped on any failure
     }
-    if not val["all_passed"]:
-        raise RuntimeError(f"Final validation failed: {val}")
 
     # How far grid rounding moved each date, in days.
+    r1, r2 = years(cal.announcement, cal.revision1_date), years(cal.announcement, cal.revision2_date)
     info = {
         "calibration": asdict(cal),
         "model": asdict(m),
@@ -917,10 +958,8 @@ def write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, re
         "information_sources": INFO_SOURCES,
         "timing_rounding_days": {
             "initial_opening_assumption": 365.2425 * (m.opening - cal.initial_opening_lag),
-            "rev1_news": 365.2425 * (grid_at_or_after(years(cal.announcement, cal.revision1_date), m.dt)
-                                     - years(cal.announcement, cal.revision1_date)),
-            "rev2_news": 365.2425 * (grid_at_or_after(years(cal.announcement, cal.revision2_date), m.dt)
-                                     - years(cal.announcement, cal.revision2_date)),
+            "rev1_news": 365.2425 * (grid_at_or_after(r1, m.dt) - r1),
+            "rev2_news": 365.2425 * (grid_at_or_after(r2, m.dt) - r2),
         },
     }
     (out / "Benchmark_1D_Calibration.json").write_text(json.dumps(info, indent=2))
@@ -969,6 +1008,18 @@ def write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, re
     return head, val
 
 
+def run(cal, raw, q, meta, out, note):
+    """Solve the benchmark and the sequential revisions, write every output, and print the headline."""
+    m, g, p0, pre, post, known, surprise, diag = solve_all(cal, raw, q)
+    rm, rev = sequential_revisions(cal, m, g, known, post, lambda p: metrics(p, g, m)["band_mass"],
+                                   "gap_at_initial_expected_opening_pp", note)
+    head, val = write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, rev)
+    pd.DataFrame(
+        [{"time": t, **metrics(rm[i], g, m)} for i, t in enumerate(g.t)]
+    ).to_csv(out / "Benchmark_1D_Sequential_Revision_Path.csv", index=False)
+    print(json.dumps({"version": VERSION, "headline": head, "validation": val}, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run the one-dimensional benchmark for Before the Factory Opens.")
     ap.add_argument("--output-dir", default="Before_the_Factory_Opens_Benchmark_1D_Output",
@@ -992,42 +1043,8 @@ def main():
         raw, q, meta = live_inputs(cal, args.refresh)
         meta["data_mode"] = "live_public_data"
     meta.update({"raw_mass": [float(v) for v in raw], "qcew": q})
-
-    m, g, p0, pre, post, known, surprise, diag = solve_all(cal, raw, q)
-
-    # Sequential revisions: news dates and new expected openings, on the grid.
-    r1 = grid_at_or_after(years(cal.announcement, cal.revision1_date), m.dt)
-    o1 = grid_at_or_after(cal.revision1_opening_lag, m.dt)
-    r2 = grid_at_or_after(years(cal.announcement, cal.revision2_date), m.dt)
-    o2 = grid_at_or_after(cal.revision2_opening_lag, m.dt)
-    rm, details = revision_path(m, g, known, post, [("2024_revision", r1, o1), ("2025_revision", r2, o2)])
-
-    i0 = time_index(g, m.opening)
-    rev = {
-        "events": details,
-        "max_mass_error": float(np.max(np.abs(rm.sum(1) - 1))),
-        "min_mass": float(rm.min()),
-        "gap_at_initial_expected_opening_pp": 100 * (metrics(known.mass[i0], g, m)["band_mass"] - metrics(rm[i0], g, m)["band_mass"]),
-        "tv_at_initial_expected_opening": tv(known.mass[i0], rm[i0]),
-        "note": "Information dates are representative public revision dates. Expected opening times are central timing assumptions, not claims of a uniquely correct operating day.",
-    }
-    rev["all_passed"] = bool(
-        rev["max_mass_error"] < 1e-10
-        and rev["min_mass"] >= -1e-12
-        and all(
-            e["inheritance_error"] < 1e-12 and e["fp"] < 2e-6 and e["hjb"] < 1e-7
-            and e["kfe"] < 1e-10 and e["min_mass"] >= -1e-12
-            for e in details
-        )
-    )
-    if not rev["all_passed"]:
-        raise RuntimeError(f"Revision-path checks failed: {rev}")
-
-    head, val = write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, rev)
-    pd.DataFrame(
-        [{"time": t, **metrics(rm[i], g, m)} for i, t in enumerate(g.t)]
-    ).to_csv(out / "Benchmark_1D_Sequential_Revision_Path.csv", index=False)
-    print(json.dumps({"version": VERSION, "headline": head, "validation": val}, indent=2))
+    run(cal, raw, q, meta, out, "Information dates are representative public revision dates. Expected opening "
+        "times are central timing assumptions, not claims of a uniquely correct operating day.")
 
 
 if __name__ == "__main__":
