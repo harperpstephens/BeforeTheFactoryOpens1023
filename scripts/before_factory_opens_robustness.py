@@ -7,16 +7,20 @@ Every row is either a solved specification or an explicit numerical failure
 with its error message. Failed cases are never turned into zero effects and
 never dropped from the tables.
 
-Usage:
-    python before_factory_opens_robustness.py --pipeline-output outputs/benchmark_1d \\
-        --output-dir reproduced_robustness_tests
-    python before_factory_opens_robustness.py --pipeline-output outputs/benchmark_1d --smoke
+Besides the per-suite CSVs, the run writes Robustness_Summary.csv (successes
+and failures per suite), Table_C1_Robustness_Summary.csv (the ranges in the
+paper's Table C1), and Robustness_Report.json, which also holds a
+time-step extrapolation of the headline ratio.
+
+Usage (from the repository root):
+    python3 scripts/before_factory_opens_robustness.py
+    python3 scripts/before_factory_opens_robustness.py --smoke
 """
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import math
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +76,23 @@ SUITE_OUTPUT_NAMES = {
     "descriptive_lodes": ("10_Descriptive_LODES_Checks", "Descriptive_LODES_Checks.csv"),
     "smoke": ("00_Smoke_Test", "Smoke_Test.csv"),
 }
+
+
+# Suites kept out of the reported ranges: the optional stress cases and the
+# descriptive LODES table (no model is solved there).
+UNREPORTED = {"stress_nonconvergent", "descriptive_lodes"}
+
+# Rows of the paper's Table C1, in order: (label, suite, column holding opening TV).
+TABLE_C1 = [
+    ("Structural parameters", "structural", "opening_tv"),
+    ("Smoothing bandwidth", "smoothing", "opening_tv"),
+    ("Project amplitude and width", "project_shock", "opening_tv"),
+    ("Spatial grid", "grid", "opening_tv"),
+    ("Time step", "time_step", "opening_tv"),
+    ("Terminal tail", "terminal_tail", "opening_tv"),
+    ("Initial opening horizon", "opening_expectation", "opening_tv"),
+    ("Sequential revision horizons", "revision_timing", "tv_at_initial_expected_opening"),
+]
 
 
 def save_suite(name, cases, out):
@@ -196,54 +217,102 @@ def holdout(cal, out, years=(2021, 2022, 2023)):
     return save_suite("descriptive_lodes", rows, out)
 
 
-def summary(out: Path):
-    """Count successes and failures per suite and write the range of headline ratios.
+def time_step_extrapolation(d: pd.DataFrame):
+    """Estimate the headline ratio as the time step goes to zero.
 
-    The ranges only cover specifications that solved. They describe how much
-    the result moves across checks; they are not confidence intervals.
+    The time-step suite solves the model at dt, dt/2, and dt/4. The two
+    successive changes in the ratio give the observed order of convergence p,
+    and Richardson extrapolation projects the finest run forward:
+
+        limit = r(dt/4) + (r(dt/4) - r(dt/2)) / (2**p - 1)
+
+    This is an estimate from three runs, not a solved specification. Returns
+    None unless all three runs solved and the ratio moves monotonically.
     """
-    files = list(out.glob("*/*.csv"))
-    rows = []
-    for f in files:
-        d = pd.read_csv(f)
-        rows.append({"suite": f.stem, "attempted": len(d), "successful": int((d.status == "ok").sum()),
-                     "failed": int((d.status != "ok").sum())})
-    s = pd.DataFrame(rows)
-    s.to_csv(out / "Robustness_Summary.csv", index=False)
+    d = d[d.status == "ok"].sort_values("dt", ascending=False)
+    if len(d) != 3 or not np.allclose(d.dt.to_numpy()[:-1] / d.dt.to_numpy()[1:], 2.0):
+        return None
+    coarse, mid, fine = (float(v) for v in d.tv_ratio)
+    if (mid - coarse) * (fine - mid) <= 0:
+        return None
+    order = math.log2((mid - coarse) / (fine - mid))
+    return {
+        "time_steps": [float(v) for v in d.dt],
+        "tv_ratio": [coarse, mid, fine],
+        "observed_order": order,
+        "tv_ratio_limit": fine + (fine - mid) / (2 ** order - 1),
+        "tv_ratio_limit_if_first_order": 2 * fine - mid,
+        "note": "Richardson extrapolation from three time steps; an estimate, not a solved specification.",
+    }
 
-    good = []
-    for f in files:
-        d = pd.read_csv(f)
-        good.append(d[d.status == "ok"])
-    g = pd.concat(good, ignore_index=True) if good else pd.DataFrame()
+
+def summary(out: Path):
+    """Count successes and failures per suite and write the ranges the paper reports.
+
+    The ranges cover only specifications that solved, and leave out the
+    optional stress cases. They describe how much the result moves across
+    checks; they are not confidence intervals.
+    """
+    suites = {}
+    for name, (folder, filename) in SUITE_OUTPUT_NAMES.items():
+        if (out / folder / filename).exists():
+            suites[name] = pd.read_csv(out / folder / filename)
+
+    rows = [{"suite": Path(SUITE_OUTPUT_NAMES[name][1]).stem, "attempted": len(d),
+             "successful": int((d.status == "ok").sum()), "failed": int((d.status != "ok").sum())}
+            for name, d in suites.items()]
+    pd.DataFrame(rows).to_csv(out / "Robustness_Summary.csv", index=False)
+
+    reported = {name: d[d.status == "ok"] for name, d in suites.items() if name not in UNREPORTED}
+    good = pd.concat(reported.values(), ignore_index=True) if reported else pd.DataFrame()
 
     report = {"suites": rows, "note": "Ranges below condition on numerical success; they are not confidence intervals."}
-    if len(g) and "tv_ratio" in g:
-        v = pd.to_numeric(g.tv_ratio, errors="coerce").dropna()
-        b = pd.to_numeric(g.band_ratio, errors="coerce").dropna()
+    if len(good) and "tv_ratio" in good:
+        v = pd.to_numeric(good.tv_ratio, errors="coerce").dropna()
+        b = pd.to_numeric(good.band_ratio, errors="coerce").dropna()
         report.update(
             tv_ratio_min=float(v.min()) if len(v) else None,
             tv_ratio_max=float(v.max()) if len(v) else None,
             band_ratio_min=float(b.min()) if len(b) else None,
             band_ratio_max=float(b.max()) if len(b) else None,
         )
+    if "time_step" in suites:
+        report["time_step_extrapolation"] = time_step_extrapolation(suites["time_step"])
     (out / "Robustness_Report.json").write_text(json.dumps(report, indent=2))
 
-    # LaTeX macros the manuscript reads its robustness range from.
-    tex = "% generated by Before the Factory Opens robustness suite (r11)\n"
+    # Table C1: one row per suite, with the range of opening TV and of the TV timing ratio.
+    table = []
+    for label, name, tv_column in TABLE_C1:
+        if name not in suites:
+            continue
+        d, ok = suites[name], reported[name]
+        row = {"variation": label, "successful_cases": f"{len(ok)}/{len(d)}"}
+        if len(ok):
+            row.update(opening_tv_min=ok[tv_column].min(), opening_tv_max=ok[tv_column].max())
+            if "tv_ratio" in ok:
+                row.update(tv_timing_pct_min=100 * ok.tv_ratio.min(), tv_timing_pct_max=100 * ok.tv_ratio.max())
+        table.append(row)
+    if table:
+        pd.DataFrame(table).to_csv(out / "Table_C1_Robustness_Summary.csv", index=False)
+
+    macros = []
     if report.get("tv_ratio_min") is not None:
-        tex += f"\\newcommand{{\\TVRatioRobustMin}}{{{report['tv_ratio_min']:.3f}}}\n\\newcommand{{\\TVRatioRobustMax}}{{{report['tv_ratio_max']:.3f}}}\n"
-        tex += f"\\newcommand{{\\TVRatioRobustMinPct}}{{{100*report['tv_ratio_min']:.1f}}}\n\\newcommand{{\\TVRatioRobustMaxPct}}{{{100*report['tv_ratio_max']:.1f}}}\n"
-    (out / "Manuscript_Robustness_Results.tex").write_text(tex)
+        macros = [("TVRatioRobustMin", report["tv_ratio_min"], ".3f", 1),
+                  ("TVRatioRobustMax", report["tv_ratio_max"], ".3f", 1),
+                  ("TVRatioRobustMinPct", report["tv_ratio_min"], ".1f", 100),
+                  ("TVRatioRobustMaxPct", report["tv_ratio_max"], ".1f", 100)]
+    core.write_macros(out / "Manuscript_Robustness_Results.tex", "robustness suite (r11)", macros)
     return report
 
 
 def main():
     ap = argparse.ArgumentParser(description="Robustness checks for the Before the Factory Opens 1D benchmark.")
-    ap.add_argument("--pipeline-output", default="Before_the_Factory_Opens_Benchmark_1D_Output",
-                    help="Folder from a benchmark or replay run (must contain Benchmark_1D_Calibration.json).")
-    ap.add_argument("--output-dir", default="Before_the_Factory_Opens_Robustness_Output",
-                    help="Where to write results. An existing folder is replaced.")
+    ap.add_argument("--pipeline-output", type=Path, default=core.REFERENCE,
+                    help="Folder from a benchmark or replay run, holding Benchmark_1D_Calibration.json "
+                         "(default: outputs/benchmark_1d).")
+    ap.add_argument("--output-dir", type=Path, default=None,
+                    help="Where to write results (default: outputs/robustness, or outputs/robustness_smoke "
+                         "with --smoke). An earlier run in that folder is replaced.")
     ap.add_argument("--smoke", action="store_true",
                     help="Run three quick cases on a coarse grid to check the code works.")
     ap.add_argument("--holdout", action="store_true",
@@ -251,11 +320,9 @@ def main():
     ap.add_argument("--stress", action="store_true", help="Also try the optional cases that are known to be numerically hard.")
     a = ap.parse_args()
 
-    cal, raw, q, mode = load_inputs(Path(a.pipeline_output))
-    out = Path(a.output_dir)
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    cal, raw, q, mode = load_inputs(a.pipeline_output)
+    out = core.fresh_output_dir(a.output_dir or core.OUTPUTS / ("robustness_smoke" if a.smoke else "robustness"),
+                                "Robustness_Summary.csv", *(folder for folder, _ in SUITE_OUTPUT_NAMES.values()))
 
     if a.smoke:
         # Keep the smoke test small and numerically easy. The full run covers

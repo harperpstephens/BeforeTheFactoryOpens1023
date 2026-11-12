@@ -22,9 +22,13 @@ If the live Census or BLS downloads fail, the program stops; it never fills in
 missing data. The ``--demo`` flag runs on synthetic inputs for code testing
 only. Those numbers are not Ohio evidence and should never be reported as such.
 
-Usage:
-    python before_factory_opens_main_model.py --output-dir outputs/live_1d_results
-    python before_factory_opens_main_model.py --demo
+Results go to outputs/live_1d_results (or outputs/demo_1d with --demo) unless
+--output-dir says otherwise. Figures are drawn separately, by
+before_factory_opens_generate_figures.py.
+
+Usage (from the repository root):
+    python3 scripts/before_factory_opens_main_model.py
+    python3 scripts/before_factory_opens_main_model.py --demo
 """
 from __future__ import annotations
 
@@ -37,7 +41,6 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
@@ -67,7 +70,12 @@ INFO_SOURCES = {
     "2024_revision": "https://www.reuters.com/technology/intel-prepares-100-bln-spending-spree-across-four-us-states-2024-03-20/",
     "2025_revision": "https://www.intel.com/content/www/us/en/newsroom/news/corporate/ohio-one-construction-timeline-update.html",
 }
-CACHE = Path(".hps_mfg_cache")
+
+# Paths are anchored to the repository, so the scripts behave the same from any directory.
+ROOT = Path(__file__).resolve().parents[1]
+CACHE = ROOT / ".hps_mfg_cache"          # downloaded Census and BLS files
+OUTPUTS = ROOT / "outputs"               # everything the scripts write
+REFERENCE = OUTPUTS / "benchmark_1d"     # saved 2021 inputs and headline results (tracked in git)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +237,27 @@ def download(url: str, name: str, refresh: bool = False) -> Path:
     return p
 
 
+def fresh_output_dir(out, *markers: str) -> Path:
+    """Create ``out`` as an empty folder, replacing only an earlier run of the same script.
+
+    ``markers`` are files or folders that script writes. A non-empty folder
+    holding none of them is left alone, and so is the saved reference folder,
+    so a mistyped --output-dir cannot delete unrelated files.
+    """
+    out = Path(out)
+    if out.resolve() == REFERENCE.resolve():
+        raise SystemExit(f"{out} holds the saved reference results; choose another --output-dir.")
+    if out.exists():
+        if not out.is_dir():
+            raise SystemExit(f"{out} exists and is not a folder.")
+        if any(out.iterdir()) and not any((out / m).exists() for m in markers):
+            raise SystemExit(f"{out} is not empty and was not written by this script; "
+                             "choose a new or empty --output-dir.")
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    return out
+
+
 def years(a: str, b: str) -> float:
     """Years between two ISO dates."""
     return (date.fromisoformat(b) - date.fromisoformat(a)).days / 365.2425
@@ -286,7 +315,7 @@ def lodes_blocks(cal: Calibration, year: Optional[int] = None, refresh=False) ->
 
 
 def lodes_mass(cal: Calibration, year: Optional[int] = None, refresh=False):
-    """Bin 2021 LODES worker residences into the model's corridor cells.
+    """Bin LODES worker residences (2021 unless ``year`` is given) into the model's corridor cells.
 
     Returns the share of workers in each cell, the total worker count in the
     corridor, and the raw share living within five miles of the site.
@@ -716,7 +745,8 @@ def headline(m, g, pre, post, known, surprise):
 
     The two ratios divide the forward-looking/surprise gap by the distance the
     surprise economy still has to travel to the long-run equilibrium. They are
-    normalizations, not shares, so nothing keeps them inside [0, 1].
+    normalizations, not shares, so nothing keeps them inside [0, 1]. A ratio is
+    None when its denominator is zero.
     """
     i = time_index(g, m.opening)
     kp, up = known.mass[i], surprise.mass[i]
@@ -724,16 +754,15 @@ def headline(m, g, pre, post, known, surprise):
     bk = metrics(kp, g, m)["band_mass"]
     bpost = metrics(post.mass, g, m)["band_mass"]
     den = bpost - bu
-    ratio = (bk - bu) / den if abs(den) > 1e-12 else np.nan
     longtv = tv(post.mass, up)
     return {
         "opening_time": m.opening,
         "projected_band_gap_pp": 100 * (bk - bu),
         "opening_tv": tv(kp, up),
         "long_run_band_gap_pp": 100 * den,
-        "band_anticipation_ratio": float(ratio),
+        "band_anticipation_ratio": float((bk - bu) / den) if abs(den) > 1e-12 else None,
         "long_run_tv_from_surprise_state": longtv,
-        "tv_anticipation_ratio": tv(kp, up) / longtv if longtv > 1e-12 else np.nan,
+        "tv_anticipation_ratio": tv(kp, up) / longtv if longtv > 1e-12 else None,
         "ratio_warning": "Ratios are normalizations, not guaranteed fractions in [0,1].",
     }
 
@@ -915,12 +944,20 @@ def live_inputs(cal, refresh=False):
 # Output files
 # ---------------------------------------------------------------------------
 
+def write_macros(path, source, macros):
+    """Write LaTeX ``\\newcommand`` lines. Each macro is (name, value, format, scale); a missing value prints as nan."""
+    lines = [f"% generated by Before the Factory Opens {source}"]
+    for name, value, fmt, scale in macros:
+        number = float("nan") if value is None else scale * value
+        lines.append(f"\\newcommand{{\\{name}}}{{{number:{fmt}}}}")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
 def write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, revision):
     """Write every output file, after a final round of validation checks.
 
     Files: calibration, headline metrics, and validation JSON; path and
-    baseline CSVs; Figure 2; and a .tex file of macros the manuscript reads
-    its numbers from.
+    baseline CSVs; and a .tex file of LaTeX macros holding the headline numbers.
     """
     out.mkdir(parents=True, exist_ok=True)
     head = headline(m, g, pre, post, known, surprise)
@@ -980,31 +1017,19 @@ def write_results(out, cal, m, g, p0, pre, post, known, surprise, diag, meta, re
         "project_premium": premium(g.x, m),
     }).to_csv(out / "Benchmark_1D_Baseline.csv", index=False)
 
-    # Figure 2: mass in the central band over time, for both economies.
-    plt.figure(figsize=(8, 5))
-    for name, z in pd.DataFrame(rows).groupby("scenario"):
-        plt.plot(z.time, z.band_mass, label=name)
-    plt.axvline(m.opening, ls="--", lw=1)
-    plt.xlabel("Years since Jan. 2022")
-    plt.ylabel("Mass in central projected band")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out / "Figure_2_Anticipatory_Adjustment_1D.png", dpi=220)
-    plt.close()
-
-    tex = ("% generated by Before the Factory Opens benchmark 1D model (r11)\n" +
-           f"\\newcommand{{\\OpeningTV}}{{{head['opening_tv']:.4f}}}\n" +
-           f"\\newcommand{{\\OpeningTVPct}}{{{100*head['opening_tv']:.2f}}}\n" +
-           f"\\newcommand{{\\TVAnticipationRatio}}{{{head['tv_anticipation_ratio']:.3f}}}\n" +
-           f"\\newcommand{{\\TVAnticipationRatioPct}}{{{100*head['tv_anticipation_ratio']:.1f}}}\n" +
-           f"\\newcommand{{\\BandAnticipationRatioPct}}{{{100*head['band_anticipation_ratio']:.1f}}}\n" +
-           f"\\newcommand{{\\ProjectedBandGapPP}}{{{head['projected_band_gap_pp']:.3f}}}\n" +
-           f"\\newcommand{{\\NoProjectOpeningTVPct}}{{{100*diag['no_project_tv_at_opening']:.2f}}}\n" +
-           f"\\newcommand{{\\ProjectScaleMiles}}{{{m.shock_h*cal.half_length_miles:.1f}}}\n" +
-           f"\\newcommand{{\\CongestionGamma}}{{{m.gamma:.2f}}}\n" +
-           f"\\newcommand{{\\SequentialGapAtInitialExpectedOpeningPP}}{{{revision.get('gap_at_initial_expected_opening_pp',float('nan')):.3f}}}\n" +
-           f"\\newcommand{{\\SequentialTVAtInitialExpectedOpeningPct}}{{{100*revision.get('tv_at_initial_expected_opening',float('nan')):.2f}}}\n")
-    (out / "Benchmark_1D_Manuscript_Results.tex").write_text(tex)
+    write_macros(out / "Benchmark_1D_Manuscript_Results.tex", "benchmark 1D model (r11)", [
+        ("OpeningTV", head["opening_tv"], ".4f", 1),
+        ("OpeningTVPct", head["opening_tv"], ".2f", 100),
+        ("TVAnticipationRatio", head["tv_anticipation_ratio"], ".3f", 1),
+        ("TVAnticipationRatioPct", head["tv_anticipation_ratio"], ".1f", 100),
+        ("BandAnticipationRatioPct", head["band_anticipation_ratio"], ".1f", 100),
+        ("ProjectedBandGapPP", head["projected_band_gap_pp"], ".3f", 1),
+        ("NoProjectOpeningTVPct", diag["no_project_tv_at_opening"], ".2f", 100),
+        ("ProjectScaleMiles", m.shock_h * cal.half_length_miles, ".1f", 1),
+        ("CongestionGamma", m.gamma, ".2f", 1),
+        ("SequentialGapAtInitialExpectedOpeningPP", revision.get("gap_at_initial_expected_opening_pp"), ".3f", 1),
+        ("SequentialTVAtInitialExpectedOpeningPct", revision.get("tv_at_initial_expected_opening"), ".2f", 100),
+    ])
     return head, val
 
 
@@ -1022,8 +1047,9 @@ def run(cal, raw, q, meta, out, note):
 
 def main():
     ap = argparse.ArgumentParser(description="Run the one-dimensional benchmark for Before the Factory Opens.")
-    ap.add_argument("--output-dir", default="Before_the_Factory_Opens_Benchmark_1D_Output",
-                    help="Where to write results. An existing folder is replaced.")
+    ap.add_argument("--output-dir", type=Path, default=None,
+                    help="Where to write results (default: outputs/live_1d_results, or outputs/demo_1d "
+                         "with --demo). An earlier run in that folder is replaced.")
     ap.add_argument("--demo", action="store_true",
                     help="Use synthetic inputs on a coarse grid. For testing code only.")
     ap.add_argument("--refresh", action="store_true",
@@ -1031,10 +1057,8 @@ def main():
     args = ap.parse_args()
 
     cal = replace(Calibration(), nx=31, dt=.20, tail_years=4.0) if args.demo else Calibration()
-    out = Path(args.output_dir)
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    out = fresh_output_dir(args.output_dir or OUTPUTS / ("demo_1d" if args.demo else "live_1d_results"),
+                           "Benchmark_1D_Calibration.json")
 
     if args.demo:
         raw, q = demo_inputs(cal)
